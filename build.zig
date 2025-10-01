@@ -15,11 +15,6 @@ pub fn build(b: *std.Build) void {
         .root_module = module,
     });
 
-    exe.root_module.addObjectFile(.{ .src_path = .{
-        .owner = b,
-        .sub_path = "/Library/glfw-3.4.bin.MACOS/lib-arm64/libglfw3.a",
-    } });
-
     const debug_option = b.option(bool, "debug", "Build the application in debug mode") orelse true;
     const options = b.addOptions();
     options.addOption(bool, "debug", debug_option);
@@ -28,7 +23,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkFramework("Cocoa", .{});
     exe.root_module.linkFramework("IOKit", .{});
     exe.root_module.linkFramework("CoreVideo", .{});
-    exe.root_module.linkSystemLibrary("MoltenVK", .{});
+    exe.root_module.linkSystemLibrary("GLFW", .{});
+    linkVulkanLib(b, exe);
 
     compileShaders(b, exe) catch @panic("There was an error while compiling shaders");
 
@@ -37,6 +33,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Runs the application");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
+}
+
+fn linkVulkanLib(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    const vulkan_sdk_env = std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch @panic("VULKAN_SDK is not set");
+    defer b.allocator.free(vulkan_sdk_env);
+    const vulkan_path = std.fmt.allocPrint(b.allocator, "{s}{s}", .{
+        vulkan_sdk_env,
+        "/lib/libvulkan.1.dylib",
+    }) catch unreachable;
+    defer b.allocator.free(vulkan_path);
+
+    exe.root_module.addObjectFile(.{ .src_path = .{
+        .owner = b,
+        .sub_path = vulkan_path,
+    } });
 }
 
 fn compileShaders(b: *std.Build, exe: *std.Build.Step.Compile) !void {

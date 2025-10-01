@@ -59,27 +59,44 @@ pub const TriangleApp = struct {
             .applicationVersion = vk.VK_MAKE_VERSION(1, 0, 0),
             .pEngineName = "No Engine",
             .engineVersion = vk.VK_MAKE_VERSION(1, 0, 0),
-            .apiVersion = vk.VK_VERSION_1_0,
+            .apiVersion = vk.VK_API_VERSION_1_0,
         };
 
         var extension_count: u32 = 0;
-        const extensions = glfw.glfwGetRequiredInstanceExtensions(&extension_count);
+        const glfw_extensions = glfw.glfwGetRequiredInstanceExtensions(&extension_count);
+        const extensions = self.allocator.alloc([*c]const u8, extension_count + 1) catch unreachable;
+        defer self.allocator.free(extensions);
+        for (0..extension_count) |i| extensions[i] = glfw_extensions[i];
+        extensions[extension_count] = "VK_KHR_portability_enumeration";
+        extension_count += 1;
 
         var create_info = vk.VkInstanceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pApplicationInfo = &app_info,
             .enabledExtensionCount = extension_count,
-            .ppEnabledExtensionNames = extensions,
+            .ppEnabledExtensionNames = &extensions[0],
             .enabledLayerCount = 0,
+            .flags = vk.VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
         };
 
         if (build_options.debug) {
             create_info.enabledLayerCount = @intCast(validation_layers.len);
-            create_info.ppEnabledLayerNames = validation_layers[0..].ptr;
+            create_info.ppEnabledLayerNames = &validation_layers[0];
         }
 
         const result = vk.vkCreateInstance(&create_info, null, &self.instance);
         if (result != vk.VK_SUCCESS) std.debug.panic("Failed to create VkInstance {}", .{result});
+    }
+
+    fn getAllRequiredExtensions(allocator: std.mem.Allocator, extension_lists: [][*c]const u8, final_len: usize) [*c][*c]const u8 {
+        const extensions = allocator.alloc([*c]const u8, final_len) catch unreachable;
+        var next_index: usize = 0;
+        for (extension_lists) |field| {
+            extensions[next_index] = field;
+            next_index += 1;
+        }
+
+        return &extensions;
     }
 
     fn checkValidationLayerSupport(self: *Self) bool {
