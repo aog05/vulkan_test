@@ -4,13 +4,35 @@ const vk = @import("vulkan.zig");
 const build_options = @import("build_options");
 const validation_layers = @import("validation_layers.zig").validation_layers;
 
+fn createDebugUtilsMessengerEXT(
+    instance: vk.VkInstance,
+    create_info: *const vk.VkDebugUtilsMessengerCreateInfoEXT,
+    allocator: ?*const vk.VkAllocationCallbacks,
+    debug_messenger: *vk.VkDebugUtilsMessengerEXT,
+) vk.VkResult {
+    const func: vk.PFN_vkCreateDebugUtilsMessengerEXT = @ptrCast(vk.vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+    if (func) |f| {
+        f(instance, create_info, allocator, debug_messenger);
+    } else return vk.VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
+fn destroyDebugUtilsMessengerEXT(
+    instance: vk.VkInstance,
+    debug_messenger: vk.VkDebugUtilsMessengerEXT,
+    allocator: ?*const vk.VkAllocationCallbacks,
+) void {
+    const func: vk.PFN_vkDestroyDebugUtilsMessengerEXT = @ptrCast(vk.vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+    if (func) |f| f(instance, debug_messenger, allocator);
+}
+
 pub const TriangleApp = struct {
     width: u32,
     height: u32,
     title: []const u8,
     window: *glfw.GLFWwindow,
-    instance: vk.VkInstance = null,
     allocator: std.mem.Allocator,
+    instance: vk.VkInstance = null,
+    debug_messenger: vk.VkDebugUtilsMessengerEXT = null,
 
     const Self = @This();
 
@@ -33,6 +55,7 @@ pub const TriangleApp = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        if (build_options.debug) destroyDebugUtilsMessengerEXT(self.instance, self.debug_messenger, null);
         vk.vkDestroyInstance(self.instance, null);
         glfw.glfwDestroyWindow(self.window);
         glfw.glfwTerminate();
@@ -62,41 +85,82 @@ pub const TriangleApp = struct {
             .apiVersion = vk.VK_API_VERSION_1_0,
         };
 
-        var extension_count: u32 = 0;
-        const glfw_extensions = glfw.glfwGetRequiredInstanceExtensions(&extension_count);
-        const extensions = self.allocator.alloc([*c]const u8, extension_count + 1) catch unreachable;
-        defer self.allocator.free(extensions);
-        for (0..extension_count) |i| extensions[i] = glfw_extensions[i];
-        extensions[extension_count] = "VK_KHR_portability_enumeration";
-        extension_count += 1;
+        var extensions = getAllRequiredExtensions(self.allocator) catch @panic("Could not get extensions due to OOM");
+        defer extensions.deinit(self.allocator);
 
         var create_info = vk.VkInstanceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pApplicationInfo = &app_info,
-            .enabledExtensionCount = extension_count,
-            .ppEnabledExtensionNames = &extensions[0],
+            .enabledExtensionCount = @intCast(extensions.items.len),
+            .ppEnabledExtensionNames = &extensions.items[0],
             .enabledLayerCount = 0,
             .flags = vk.VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
         };
 
+        var debug_create_info = vk.VkDebugUtilsMessengerCreateInfoEXT{};
         if (build_options.debug) {
             create_info.enabledLayerCount = @intCast(validation_layers.len);
             create_info.ppEnabledLayerNames = &validation_layers[0];
+
+            populateDebugMessengerCreateInfo(&debug_create_info);
+            create_info.pNext = &debug_create_info;
         }
 
         const result = vk.vkCreateInstance(&create_info, null, &self.instance);
         if (result != vk.VK_SUCCESS) std.debug.panic("Failed to create VkInstance {}", .{result});
     }
 
-    fn getAllRequiredExtensions(allocator: std.mem.Allocator, extension_lists: [][*c]const u8, final_len: usize) [*c][*c]const u8 {
-        const extensions = allocator.alloc([*c]const u8, final_len) catch unreachable;
-        var next_index: usize = 0;
-        for (extension_lists) |field| {
-            extensions[next_index] = field;
-            next_index += 1;
-        }
+    fn getAllRequiredExtensions(allocator: std.mem.Allocator) error{OutOfMemory}!std.ArrayList([*c]const u8) {
+        var glfw_extension_count: u32 = 0;
+        const glfw_extensions = glfw.glfwGetRequiredInstanceExtensions(&glfw_extension_count);
+        var extensions = try std.ArrayList([*c]const u8).initCapacity(allocator, glfw_extension_count);
+        for (0..glfw_extension_count) |i|
+            try extensions.append(allocator, glfw_extensions[i]);
+        try extensions.append(allocator, vk.VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 
-        return &extensions;
+        if (build_options.debug)
+            try extensions.append(allocator, vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+
+        return extensions;
+    }
+
+    fn setupDebugMessenger(self: *Self) void {
+        const debug_messenger_create_info = vk.VkDebugUtilsMessengerCreateInfoEXT{};
+        populateDebugMessengerCreateInfo(&debug_messenger_create_info);
+
+        const result = createDebugUtilsMessengerEXT(
+            self.instance,
+            &debug_messenger_create_info,
+            null,
+            &self.debug_messenger,
+        );
+        if (result != vk.VK_SUCCESS)
+            std.debug.panic("Could not create debug messenger {}", .{result});
+    }
+
+    fn populateDebugMessengerCreateInfo(create_info: *vk.VkDebugUtilsMessengerCreateInfoEXT) void {
+        create_info.* = .{
+            .sType = vk.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = vk.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = debugCallback,
+            .pUserData = null,
+        };
+    }
+
+    fn debugCallback(
+        severity: vk.VkDebugUtilsMessageSeverityFlagBitsEXT,
+        message_type: vk.VkDebugUtilsMessageTypeFlagsEXT,
+        callback_data: [*c]const vk.VkDebugUtilsMessengerCallbackDataEXT,
+        user_data: ?*anyopaque,
+    ) callconv(.c) vk.VkBool32 {
+        _ = message_type;
+        _ = user_data;
+
+        if (severity >= vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+            std.debug.print("Debug call {s}\n", .{callback_data.*.pMessage});
+
+        return vk.VK_FALSE;
     }
 
     fn checkValidationLayerSupport(self: *Self) bool {
