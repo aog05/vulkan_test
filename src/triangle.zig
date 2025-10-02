@@ -1,6 +1,6 @@
 const std = @import("std");
-const glfw = @import("glfw.zig");
-const vk = @import("vulkan.zig");
+const glfw = @import("headers/glfw.zig");
+const vk = @import("headers/vulkan.zig");
 const build_options = @import("build_options");
 const validation_layers = @import("validation_layers.zig").validation_layers;
 
@@ -35,6 +35,7 @@ pub const TriangleApp = struct {
     allocator: std.mem.Allocator,
     instance: vk.VkInstance = null,
     debug_messenger: vk.VkDebugUtilsMessengerEXT = null,
+    surface: vk.VkSurfaceKHR = null,
     physical_device: vk.VkPhysicalDevice = null,
     device: vk.VkDevice = null,
     graphics_queue: vk.VkQueue = null,
@@ -85,6 +86,7 @@ pub const TriangleApp = struct {
     fn initVulkan(self: *Self) void {
         self.createInstance();
         self.setupDebugMessenger();
+        self.createSurface();
         self.pickPhysicalDevice();
         self.createLogicalDevice();
     }
@@ -135,6 +137,7 @@ pub const TriangleApp = struct {
             try extensions.append(allocator, glfw_extensions[i]);
         try extensions.append(allocator, vk.VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
         try extensions.append(allocator, vk.VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+        try extensions.append(allocator, "VK_MVK_macos_surface");
 
         if (build_options.debug)
             try extensions.append(allocator, vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -154,6 +157,13 @@ pub const TriangleApp = struct {
         );
         if (result != vk.VK_SUCCESS)
             std.debug.panic("Could not create debug messenger {}", .{result});
+    }
+
+    fn createSurface(self: *Self) void {
+        _ = self;
+        // const create_info = vk.{
+        //     .sType = vk.VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR,
+        // };
     }
 
     fn pickPhysicalDevice(self: *Self) void {

@@ -15,18 +15,30 @@ pub fn build(b: *std.Build) void {
         .root_module = module,
     });
 
+    const vulkan_sdk_env = std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch @panic("VULKAN_SDK is not set");
+    defer b.allocator.free(vulkan_sdk_env);
+
     const debug_option = b.option(bool, "debug", "Build the application in debug mode") orelse true;
+    const translate_headers_option = b.option(
+        bool,
+        "translate-headers",
+        "Translate all of the vulkan and glfw headers",
+    ) orelse false;
     const options = b.addOptions();
     options.addOption(bool, "debug", debug_option);
+    options.addOption(bool, "translate-headers", translate_headers_option);
     exe.root_module.addOptions("build_options", options);
 
     exe.root_module.linkFramework("Cocoa", .{});
     exe.root_module.linkFramework("IOKit", .{});
     exe.root_module.linkFramework("CoreVideo", .{});
     exe.root_module.linkSystemLibrary("GLFW", .{});
-    linkVulkanLib(b, exe);
+    linkVulkanLib(b, exe, vulkan_sdk_env);
 
     compileShaders(b, exe) catch @panic("There was an error while compiling shaders");
+
+    if (translate_headers_option)
+        translateHeaders(b, vulkan_sdk_env) catch @panic("Could not translate headers");
 
     b.installArtifact(exe);
 
@@ -35,9 +47,40 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 }
 
-fn linkVulkanLib(b: *std.Build, exe: *std.Build.Step.Compile) void {
-    const vulkan_sdk_env = std.process.getEnvVarOwned(b.allocator, "VULKAN_SDK") catch @panic("VULKAN_SDK is not set");
-    defer b.allocator.free(vulkan_sdk_env);
+fn translateHeaders(b: *std.Build, vulkan_sdk_env: []u8) !void {
+    const vulkan_include_dir = try std.fmt.allocPrint(b.allocator, "{s}/include", .{vulkan_sdk_env});
+    const vulkan_include_h = try std.fmt.allocPrint(b.allocator, "{s}/include/vulkan/vulkan.h", .{vulkan_sdk_env});
+    defer b.allocator.free(vulkan_include_dir);
+    defer b.allocator.free(vulkan_include_h);
+
+    const translate_glfw = b.addSystemCommand(&.{
+        "zig",
+        "translate-c",
+        "/opt/homebrew/include/GLFW/glfw3.h",
+        "-D",
+        "GLFW_INCLUDE_VULKAN=1",
+        "-I",
+        vulkan_include_dir,
+        "> src/headers/glfw.zig",
+    });
+
+    b.getInstallStep().dependOn(&translate_glfw.step);
+
+    const translate_vulkan = b.addSystemCommand(&.{
+        "zig",
+        "translate-c",
+        vulkan_include_h,
+        "-D",
+        "VK_USE_PLATFORM_METAL_EXT=1",
+        "-I",
+        vulkan_include_dir,
+        "> src/headers/vulkan.zig",
+    });
+
+    b.getInstallStep().dependOn(&translate_vulkan.step);
+}
+
+fn linkVulkanLib(b: *std.Build, exe: *std.Build.Step.Compile, vulkan_sdk_env: []u8) void {
     const vulkan_path = std.fmt.allocPrint(b.allocator, "{s}{s}", .{
         vulkan_sdk_env,
         "/lib/libvulkan.1.dylib",
