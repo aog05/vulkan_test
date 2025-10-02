@@ -12,8 +12,10 @@ fn createDebugUtilsMessengerEXT(
 ) vk.VkResult {
     const func: vk.PFN_vkCreateDebugUtilsMessengerEXT = @ptrCast(vk.vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
     if (func) |f| {
-        f(instance, create_info, allocator, debug_messenger);
+        _ = f(instance, create_info, allocator, debug_messenger);
     } else return vk.VK_ERROR_EXTENSION_NOT_PRESENT;
+
+    return vk.VK_SUCCESS;
 }
 
 fn destroyDebugUtilsMessengerEXT(
@@ -33,8 +35,19 @@ pub const TriangleApp = struct {
     allocator: std.mem.Allocator,
     instance: vk.VkInstance = null,
     debug_messenger: vk.VkDebugUtilsMessengerEXT = null,
+    physical_device: vk.VkPhysicalDevice = null,
+    device: vk.VkDevice = null,
+    graphics_queue: vk.VkQueue = null,
 
     const Self = @This();
+
+    const QueueFamilyIndices = struct {
+        graphics_family: ?u32 = null,
+
+        pub fn isComplete(self: *const QueueFamilyIndices) bool {
+            return self.graphics_family != null;
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) Self {
         const width = 800;
@@ -56,6 +69,7 @@ pub const TriangleApp = struct {
 
     pub fn deinit(self: *Self) void {
         if (build_options.debug) destroyDebugUtilsMessengerEXT(self.instance, self.debug_messenger, null);
+        vk.vkDestroyDevice(self.device, null);
         vk.vkDestroyInstance(self.instance, null);
         glfw.glfwDestroyWindow(self.window);
         glfw.glfwTerminate();
@@ -70,6 +84,9 @@ pub const TriangleApp = struct {
 
     fn initVulkan(self: *Self) void {
         self.createInstance();
+        self.setupDebugMessenger();
+        self.pickPhysicalDevice();
+        self.createLogicalDevice();
     }
 
     fn createInstance(self: *Self) void {
@@ -117,6 +134,7 @@ pub const TriangleApp = struct {
         for (0..glfw_extension_count) |i|
             try extensions.append(allocator, glfw_extensions[i]);
         try extensions.append(allocator, vk.VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        try extensions.append(allocator, vk.VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 
         if (build_options.debug)
             try extensions.append(allocator, vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -125,7 +143,7 @@ pub const TriangleApp = struct {
     }
 
     fn setupDebugMessenger(self: *Self) void {
-        const debug_messenger_create_info = vk.VkDebugUtilsMessengerCreateInfoEXT{};
+        var debug_messenger_create_info = vk.VkDebugUtilsMessengerCreateInfoEXT{};
         populateDebugMessengerCreateInfo(&debug_messenger_create_info);
 
         const result = createDebugUtilsMessengerEXT(
@@ -136,6 +154,103 @@ pub const TriangleApp = struct {
         );
         if (result != vk.VK_SUCCESS)
             std.debug.panic("Could not create debug messenger {}", .{result});
+    }
+
+    fn pickPhysicalDevice(self: *Self) void {
+        var device_count: u32 = 0;
+        _ = vk.vkEnumeratePhysicalDevices(self.instance, &device_count, null);
+        if (device_count == 0) @panic("There were no physical devices found");
+
+        var physical_devices = std.ArrayList(vk.VkPhysicalDevice).initCapacity(
+            self.allocator,
+            device_count,
+        ) catch @panic("OOM");
+        defer physical_devices.deinit(self.allocator);
+        physical_devices.resize(self.allocator, device_count) catch @panic("OOM");
+
+        _ = vk.vkEnumeratePhysicalDevices(
+            self.instance,
+            &device_count,
+            physical_devices.items.ptr,
+        );
+
+        for (physical_devices.items) |device| {
+            if (isDeviceSuitable(self.allocator, device)) {
+                self.physical_device = device;
+                break;
+            }
+        }
+
+        if (self.physical_device == null)
+            @panic("There are no suitable physical devices");
+    }
+
+    fn isDeviceSuitable(allocator: std.mem.Allocator, physical_device: vk.VkPhysicalDevice) bool {
+        const indices = findQueueFamilies(allocator, physical_device);
+        return indices.isComplete();
+    }
+
+    fn findQueueFamilies(allocator: std.mem.Allocator, physical_device: vk.VkPhysicalDevice) QueueFamilyIndices {
+        var indices: QueueFamilyIndices = .{};
+
+        var queue_family_count: u32 = 0;
+        vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, null);
+        var queue_families = std.ArrayList(vk.VkQueueFamilyProperties).initCapacity(
+            allocator,
+            queue_family_count,
+        ) catch @panic("OOM");
+        defer queue_families.deinit(allocator);
+        queue_families.resize(allocator, queue_family_count) catch @panic("OOM");
+
+        vk.vkGetPhysicalDeviceQueueFamilyProperties(
+            physical_device,
+            &queue_family_count,
+            queue_families.items.ptr,
+        );
+
+        for (queue_families.items, 0..) |queue_family, i| {
+            if (queue_family.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT != 0) {
+                indices.graphics_family = @intCast(i);
+                if (indices.isComplete()) break;
+            }
+        }
+
+        return indices;
+    }
+
+    fn createLogicalDevice(self: *Self) void {
+        const indices = findQueueFamilies(self.allocator, self.physical_device);
+
+        var queue_create_info = vk.VkDeviceQueueCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = indices.graphics_family.?,
+            .queueCount = 1,
+        };
+        const queue_priority: f32 = 1.0;
+        queue_create_info.pQueuePriorities = &queue_priority;
+
+        const device_features: vk.VkPhysicalDeviceFeatures = .{};
+
+        const extensions = [_][*c]const u8{"VK_KHR_portability_subset"};
+        var device_create_info = vk.VkDeviceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .pQueueCreateInfos = &queue_create_info,
+            .queueCreateInfoCount = 1,
+            .pEnabledFeatures = &device_features,
+            .enabledExtensionCount = extensions.len,
+            .ppEnabledExtensionNames = &extensions[0],
+            .enabledLayerCount = 0,
+        };
+
+        if (build_options.debug) {
+            device_create_info.enabledLayerCount = 1;
+            device_create_info.ppEnabledLayerNames = &validation_layers[0];
+        }
+
+        const result = vk.vkCreateDevice(self.physical_device, &device_create_info, null, &self.device);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create logical device {}", .{result});
+
+        vk.vkGetDeviceQueue(self.device, indices.graphics_family.?, 0, &self.graphics_queue);
     }
 
     fn populateDebugMessengerCreateInfo(create_info: *vk.VkDebugUtilsMessengerCreateInfoEXT) void {
@@ -158,7 +273,7 @@ pub const TriangleApp = struct {
         _ = user_data;
 
         if (severity >= vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-            std.debug.print("Debug call {s}\n", .{callback_data.*.pMessage});
+            std.debug.print("{s}\n", .{callback_data.*.pMessage});
 
         return vk.VK_FALSE;
     }
