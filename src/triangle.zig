@@ -117,6 +117,7 @@ pub const TriangleApp = struct {
         self.createLogicalDevice();
         self.createSwapChain();
         self.createImageViews();
+        self.createGraphicsPipeline();
     }
 
     fn createInstance(self: *Self) void {
@@ -445,6 +446,10 @@ pub const TriangleApp = struct {
             );
             if (result != vk.VK_SUCCESS) std.debug.panic("Could not create image view {}\n", .{result});
         }
+    }
+
+    fn createGraphicsPipeline(self: *Self) void {
+        _ = self;
     }
 
     fn populateDebugMessengerCreateInfo(create_info: *vk.VkDebugUtilsMessengerCreateInfoEXT) void {

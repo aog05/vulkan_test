@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("GLFW", .{});
     linkVulkanLib(b, exe, vulkan_sdk_env);
 
-    compileShaders(b, exe) catch @panic("There was an error while compiling shaders");
+    compileShaders(b) catch @panic("There was an error while compiling shaders");
 
     if (translate_headers_option)
         translateHeaders(b, vulkan_sdk_env) catch @panic("Could not translate headers");
@@ -81,9 +81,8 @@ fn translateHeaders(b: *std.Build, vulkan_sdk_env: []u8) !void {
 }
 
 fn linkVulkanLib(b: *std.Build, exe: *std.Build.Step.Compile, vulkan_sdk_env: []u8) void {
-    const vulkan_path = std.fmt.allocPrint(b.allocator, "{s}{s}", .{
+    const vulkan_path = std.fmt.allocPrint(b.allocator, "{s}/lib/libvulkan.1.dylib", .{
         vulkan_sdk_env,
-        "/lib/libvulkan.1.dylib",
     }) catch unreachable;
     defer b.allocator.free(vulkan_path);
 
@@ -93,24 +92,28 @@ fn linkVulkanLib(b: *std.Build, exe: *std.Build.Step.Compile, vulkan_sdk_env: []
     } });
 }
 
-fn compileShaders(b: *std.Build, exe: *std.Build.Step.Compile) !void {
-    const shader_dir = try b.build_root.handle.openDir("shaders", .{});
+fn compileShaders(b: *std.Build) !void {
+    const shader_dir = try b.build_root.handle.openDir("src/shaders", .{});
+
+    const spirv_directory_command = b.addSystemCommand(&.{ "mkdir", "-p", "src/shaders/spir-v" });
+    b.getInstallStep().dependOn(&spirv_directory_command.step);
 
     var file_iterator = shader_dir.iterate();
     while (try file_iterator.next()) |entry| {
         if (entry.kind == .file) {
-            const extension = std.fs.path.extension(entry.name);
             const basename = std.fs.path.basename(entry.name);
-            const name = basename[0 .. basename.len - extension.len];
 
-            const source = try std.fmt.allocPrint(b.allocator, "shaders/{s}", .{basename});
-            const output = try std.fmt.allocPrint(b.allocator, "shaders/{s}.spv", .{basename});
-            const compiler_command = b.addSystemCommand(&.{"glslangValidator"});
-            compiler_command.addArgs(&.{ "-V", "-o" });
-            const compiler_output = compiler_command.addOutputFileArg(output);
-            compiler_command.addFileArg(b.path(source));
+            const source = try std.fmt.allocPrint(b.allocator, "src/shaders/{s}", .{basename});
+            const output = try std.fmt.allocPrint(b.allocator, "src/shaders/spir-v/{s}.spv", .{basename});
+            defer b.allocator.free(source);
+            defer b.allocator.free(output);
 
-            exe.root_module.addAnonymousImport(name, .{ .root_source_file = compiler_output });
+            const compiler_command = b.addSystemCommand(&.{
+                "glslangValidator",
+                source,
+            });
+            compiler_command.addArgs(&.{ "-V", "-o", output });
+            b.getInstallStep().dependOn(&compiler_command.step);
         }
     }
 }
