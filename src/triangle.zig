@@ -45,9 +45,13 @@ pub const TriangleApp = struct {
     device: vk.VkDevice = null,
     graphics_queue: vk.VkQueue = null,
     present_queue: vk.VkQueue = null,
+    render_pass: vk.VkRenderPass = null,
+    pipeline_layout: vk.VkPipelineLayout = null,
+    pipeline: vk.VkPipeline = null,
 
     swap_chain_images: std.array_list.Aligned(vk.VkImage, null),
     swap_chain_image_views: std.array_list.Aligned(vk.VkImageView, null),
+    framebuffers: std.array_list.Aligned(vk.VkFramebuffer, null),
 
     const Self = @This();
 
@@ -78,6 +82,7 @@ pub const TriangleApp = struct {
             .allocator = allocator,
             .swap_chain_images = std.ArrayList(vk.VkImage).initCapacity(allocator, 0) catch unreachable,
             .swap_chain_image_views = std.ArrayList(vk.VkImageView).initCapacity(allocator, 0) catch unreachable,
+            .framebuffers = std.ArrayList(vk.VkFramebuffer).initCapacity(allocator, 0) catch unreachable,
         };
     }
 
@@ -87,13 +92,19 @@ pub const TriangleApp = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.swap_chain_image_views.items) |image_view| {
+        for (self.swap_chain_image_views.items) |image_view|
             vk.vkDestroyImageView(self.device, image_view, null);
-        }
+        for (self.framebuffers.items) |framebuffer|
+            vk.vkDestroyFramebuffer(self.device, framebuffer, null);
+
         self.swap_chain_images.deinit(self.allocator);
         self.swap_chain_image_views.deinit(self.allocator);
+        self.framebuffers.deinit(self.allocator);
 
         if (build_options.debug) destroyDebugUtilsMessengerEXT(self.instance, self.debug_messenger, null);
+        vk.vkDestroyPipeline(self.device, self.pipeline, null);
+        vk.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
+        vk.vkDestroyRenderPass(self.device, self.render_pass, null);
         vk.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
         vk.vkDestroySurfaceKHR(self.instance, self.surface, null);
         vk.vkDestroyDevice(self.device, null);
@@ -117,7 +128,9 @@ pub const TriangleApp = struct {
         self.createLogicalDevice();
         self.createSwapChain();
         self.createImageViews();
+        self.createRenderPass();
         self.createGraphicsPipeline();
+        self.createFramebuffers();
     }
 
     fn createInstance(self: *Self) void {
@@ -448,8 +461,229 @@ pub const TriangleApp = struct {
         }
     }
 
+    fn createRenderPass(self: *Self) void {
+        const color_attachment = vk.VkAttachmentDescription{
+            .format = self.swap_chain_image_format,
+            .samples = vk.VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = vk.VK_ATTACHMENT_STORE_OP_STORE,
+            .stencilLoadOp = vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        };
+
+        const color_attachment_ref = vk.VkAttachmentReference{
+            .attachment = 0,
+            .layout = vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+
+        const subpass = vk.VkSubpassDescription{
+            .pipelineBindPoint = vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color_attachment_ref,
+        };
+
+        const render_pass_create_info = vk.VkRenderPassCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = 1,
+            .pAttachments = &color_attachment,
+            .subpassCount = 1,
+            .pSubpasses = &subpass,
+        };
+
+        const result = vk.vkCreateRenderPass(self.device, &render_pass_create_info, null, &self.render_pass);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create render pass {}\n", .{result});
+    }
+
     fn createGraphicsPipeline(self: *Self) void {
-        _ = self;
+        const vert_shader_code: []const u8 = @embedFile("shaders/spir-v/triangle.vert.spv");
+        const frag_shader_code: []const u8 = @embedFile("shaders/spir-v/triangle.frag.spv");
+        const reinterpret_vert_code: *const [vert_shader_code.len / 4]u32 = @ptrCast(@alignCast(vert_shader_code.ptr));
+        const reinterpret_frag_code: *const [frag_shader_code.len / 4]u32 = @ptrCast(@alignCast(frag_shader_code.ptr));
+
+        const vert_shader_module = self.createShaderModule(&reinterpret_vert_code.*);
+        const frag_shader_module = self.createShaderModule(&reinterpret_frag_code.*);
+        defer vk.vkDestroyShaderModule(self.device, vert_shader_module, null);
+        defer vk.vkDestroyShaderModule(self.device, frag_shader_module, null);
+
+        const vert_shader_stage_info = vk.VkPipelineShaderStageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .module = vert_shader_module,
+            .pName = "main",
+        };
+
+        const frag_shader_stage_info = vk.VkPipelineShaderStageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+            .module = frag_shader_module,
+            .pName = "main",
+        };
+
+        const shader_stages = [_]vk.VkPipelineShaderStageCreateInfo{
+            vert_shader_stage_info,
+            frag_shader_stage_info,
+        };
+
+        const vertex_input_state = vk.VkPipelineVertexInputStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = 0,
+            .pVertexBindingDescriptions = null,
+            .vertexAttributeDescriptionCount = 0,
+            .pVertexAttributeDescriptions = null,
+        };
+
+        const dynamic_state_buffer = [_]vk.VkDynamicState{
+            vk.VK_DYNAMIC_STATE_VIEWPORT,
+            vk.VK_DYNAMIC_STATE_SCISSOR,
+        };
+        var dynamic_states = std.ArrayList(vk.VkDynamicState).initCapacity(
+            self.allocator,
+            dynamic_state_buffer.len,
+        ) catch @panic("OOM");
+        dynamic_states.insertSlice(self.allocator, 0, &dynamic_state_buffer) catch @panic("OOM");
+        defer dynamic_states.deinit(self.allocator);
+        const dynamic_state = vk.VkPipelineDynamicStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = @intCast(dynamic_states.items.len),
+            .pDynamicStates = &dynamic_states.items[0],
+        };
+
+        const input_assembly = vk.VkPipelineInputAssemblyStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .topology = vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            .primitiveRestartEnable = vk.VK_FALSE,
+        };
+
+        const viewport = vk.VkViewport{
+            .x = 0.0,
+            .y = 0.0,
+            .width = @floatFromInt(self.swap_chain_extent.width),
+            .height = @floatFromInt(self.swap_chain_extent.height),
+            .minDepth = 0.0,
+            .maxDepth = 1.0,
+        };
+
+        const scissor = vk.VkRect2D{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = self.swap_chain_extent,
+        };
+
+        const viewport_state = vk.VkPipelineViewportStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .viewportCount = 1,
+            .pViewports = &viewport,
+            .scissorCount = 1,
+            .pScissors = &scissor,
+        };
+
+        const rasterizer = vk.VkPipelineRasterizationStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .depthClampEnable = vk.VK_FALSE,
+            .rasterizerDiscardEnable = vk.VK_FALSE,
+            .polygonMode = vk.VK_POLYGON_MODE_FILL,
+            .lineWidth = 1.0,
+            .cullMode = vk.VK_CULL_MODE_BACK_BIT,
+            .frontFace = vk.VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            .depthBiasEnable = vk.VK_FALSE,
+        };
+
+        const multisampling = vk.VkPipelineMultisampleStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .sampleShadingEnable = vk.VK_FALSE,
+            .rasterizationSamples = vk.VK_SAMPLE_COUNT_1_BIT,
+        };
+
+        const color_blend_attachment = vk.VkPipelineColorBlendAttachmentState{
+            .colorWriteMask = vk.VK_COLOR_COMPONENT_R_BIT | vk.VK_COLOR_COMPONENT_G_BIT | vk.VK_COLOR_COMPONENT_B_BIT | vk.VK_COLOR_COMPONENT_A_BIT,
+            .blendEnable = vk.VK_FALSE,
+        };
+
+        const color_blending = vk.VkPipelineColorBlendStateCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .logicOpEnable = vk.VK_FALSE,
+            .attachmentCount = 1,
+            .pAttachments = &color_blend_attachment,
+        };
+
+        const pipeline_layout_info = vk.VkPipelineLayoutCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        };
+
+        const layout_result = vk.vkCreatePipelineLayout(
+            self.device,
+            &pipeline_layout_info,
+            null,
+            &self.pipeline_layout,
+        );
+        if (layout_result != vk.VK_SUCCESS)
+            std.debug.panic("Could not create pipeline layout {}\n", .{layout_result});
+
+        const pipeline_info = vk.VkGraphicsPipelineCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .stageCount = @intCast(shader_stages.len),
+            .pStages = &shader_stages[0],
+            .pVertexInputState = &vertex_input_state,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState = &viewport_state,
+            .pRasterizationState = &rasterizer,
+            .pMultisampleState = &multisampling,
+            .pDepthStencilState = null,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_state,
+            .layout = self.pipeline_layout,
+            .renderPass = self.render_pass,
+            .subpass = 0,
+        };
+
+        const graphics_pipeline_result = vk.vkCreateGraphicsPipelines(
+            self.device,
+            null,
+            1,
+            &pipeline_info,
+            null,
+            &self.pipeline,
+        );
+        if (graphics_pipeline_result != vk.VK_SUCCESS)
+            std.debug.print("Could not create graphics pipeline {}\n", .{graphics_pipeline_result});
+    }
+
+    fn createFramebuffers(self: *Self) void {
+        self.framebuffers.resize(self.allocator, self.swap_chain_image_views.items.len) catch @panic("OOM");
+
+        for (self.swap_chain_image_views.items, 0..) |image_view, i| {
+            const framebuffer_info = vk.VkFramebufferCreateInfo{
+                .sType = vk.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .renderPass = self.render_pass,
+                .attachmentCount = 1,
+                .pAttachments = &image_view,
+                .width = self.swap_chain_extent.width,
+                .height = self.swap_chain_extent.height,
+                .layers = 1,
+            };
+
+            const result = vk.vkCreateFramebuffer(
+                self.device,
+                &framebuffer_info,
+                null,
+                &self.framebuffers.items[i],
+            );
+            if (result != vk.VK_SUCCESS) std.debug.panic("Could not create frame buffer {}\n", .{result});
+        }
+    }
+
+    fn createShaderModule(self: *Self, code: []const u32) vk.VkShaderModule {
+        const create_info = vk.VkShaderModuleCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = code.len * 4,
+            .pCode = code.ptr,
+        };
+
+        var shader_module: vk.VkShaderModule = null;
+        const result = vk.vkCreateShaderModule(self.device, &create_info, null, &shader_module);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create shader module {}\n", .{result});
+        return shader_module;
     }
 
     fn populateDebugMessengerCreateInfo(create_info: *vk.VkDebugUtilsMessengerCreateInfoEXT) void {
