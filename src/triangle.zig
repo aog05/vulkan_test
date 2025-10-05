@@ -48,6 +48,11 @@ pub const TriangleApp = struct {
     render_pass: vk.VkRenderPass = null,
     pipeline_layout: vk.VkPipelineLayout = null,
     pipeline: vk.VkPipeline = null,
+    command_pool: vk.VkCommandPool = null,
+    command_buffer: vk.VkCommandBuffer = null,
+    image_available_semaphore: vk.VkSemaphore = null,
+    image_finished_semaphore: vk.VkSemaphore = null,
+    in_flight_fence: vk.VkFence = null,
 
     swap_chain_images: std.array_list.Aligned(vk.VkImage, null),
     swap_chain_image_views: std.array_list.Aligned(vk.VkImageView, null),
@@ -92,6 +97,10 @@ pub const TriangleApp = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        vk.vkDestroySemaphore(self.device, self.image_available_semaphore, null);
+        vk.vkDestroySemaphore(self.device, self.image_finished_semaphore, null);
+        vk.vkDestroyFence(self.device, self.in_flight_fence, null);
+
         for (self.swap_chain_image_views.items) |image_view|
             vk.vkDestroyImageView(self.device, image_view, null);
         for (self.framebuffers.items) |framebuffer|
@@ -102,6 +111,7 @@ pub const TriangleApp = struct {
         self.framebuffers.deinit(self.allocator);
 
         if (build_options.debug) destroyDebugUtilsMessengerEXT(self.instance, self.debug_messenger, null);
+        vk.vkDestroyCommandPool(self.device, self.command_pool, null);
         vk.vkDestroyPipeline(self.device, self.pipeline, null);
         vk.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
         vk.vkDestroyRenderPass(self.device, self.render_pass, null);
@@ -131,6 +141,9 @@ pub const TriangleApp = struct {
         self.createRenderPass();
         self.createGraphicsPipeline();
         self.createFramebuffers();
+        self.createCommandPool();
+        self.createCommandBuffer();
+        self.createSyncObjects();
     }
 
     fn createInstance(self: *Self) void {
@@ -484,12 +497,23 @@ pub const TriangleApp = struct {
             .pColorAttachments = &color_attachment_ref,
         };
 
+        const subpass_dependency = vk.VkSubpassDependency{
+            .srcSubpass = vk.VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = 0,
+            .dstAccessMask = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        };
+
         const render_pass_create_info = vk.VkRenderPassCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
             .attachmentCount = 1,
             .pAttachments = &color_attachment,
             .subpassCount = 1,
             .pSubpasses = &subpass,
+            .dependencyCount = 1,
+            .pDependencies = &subpass_dependency,
         };
 
         const result = vk.vkCreateRenderPass(self.device, &render_pass_create_info, null, &self.render_pass);
@@ -649,6 +673,19 @@ pub const TriangleApp = struct {
             std.debug.print("Could not create graphics pipeline {}\n", .{graphics_pipeline_result});
     }
 
+    fn createShaderModule(self: *Self, code: []const u32) vk.VkShaderModule {
+        const create_info = vk.VkShaderModuleCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = code.len * 4,
+            .pCode = code.ptr,
+        };
+
+        var shader_module: vk.VkShaderModule = null;
+        const result = vk.vkCreateShaderModule(self.device, &create_info, null, &shader_module);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create shader module {}\n", .{result});
+        return shader_module;
+    }
+
     fn createFramebuffers(self: *Self) void {
         self.framebuffers.resize(self.allocator, self.swap_chain_image_views.items.len) catch @panic("OOM");
 
@@ -673,17 +710,45 @@ pub const TriangleApp = struct {
         }
     }
 
-    fn createShaderModule(self: *Self, code: []const u32) vk.VkShaderModule {
-        const create_info = vk.VkShaderModuleCreateInfo{
-            .sType = vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .codeSize = code.len * 4,
-            .pCode = code.ptr,
+    fn createCommandPool(self: *Self) void {
+        const queue_family_indices = self.findQueueFamilies(self.physical_device);
+
+        const create_info = vk.VkCommandPoolCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = vk.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .queueFamilyIndex = queue_family_indices.graphics_family.?,
         };
 
-        var shader_module: vk.VkShaderModule = null;
-        const result = vk.vkCreateShaderModule(self.device, &create_info, null, &shader_module);
-        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create shader module {}\n", .{result});
-        return shader_module;
+        const result = vk.vkCreateCommandPool(self.device, &create_info, null, &self.command_pool);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not create command pool {}\n", .{result});
+    }
+
+    fn createCommandBuffer(self: *Self) void {
+        const alloc_info = vk.VkCommandBufferAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = self.command_pool,
+            .level = vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+
+        const result = vk.vkAllocateCommandBuffers(self.device, &alloc_info, &self.command_buffer);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Could not allocate command buffer {}\n", .{result});
+    }
+
+    fn createSyncObjects(self: *Self) void {
+        const semaphore_info = vk.VkSemaphoreCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        };
+
+        const fence_info = vk.VkFenceCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = vk.VK_FENCE_CREATE_SIGNALED_BIT,
+        };
+
+        const result = vk.vkCreateSemaphore(self.device, &semaphore_info, null, &self.image_available_semaphore) == vk.VK_SUCCESS and
+            vk.vkCreateSemaphore(self.device, &semaphore_info, null, &self.image_finished_semaphore) == vk.VK_SUCCESS and
+            vk.vkCreateFence(self.device, &fence_info, null, &self.in_flight_fence) == vk.VK_SUCCESS;
+        if (!result) std.debug.panic("Could not create sync objects\n", .{});
     }
 
     fn populateDebugMessengerCreateInfo(create_info: *vk.VkDebugUtilsMessengerCreateInfoEXT) void {
@@ -841,9 +906,109 @@ pub const TriangleApp = struct {
         }
     }
 
+    fn recordCommandBuffer(self: *Self, command_buffer: vk.VkCommandBuffer, image_index: u32) void {
+        const begin_info = vk.VkCommandBufferBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        };
+
+        const begin_result = vk.vkBeginCommandBuffer(command_buffer, &begin_info);
+        if (begin_result != vk.VK_SUCCESS) std.debug.panic("Could not begin command buffer {}\n", .{begin_result});
+
+        const clear_color = vk.VkClearValue{
+            .color = .{
+                .float32 = .{ 0.0, 0.0, 0.0, 1.0 },
+            },
+        };
+
+        const render_pass_info = vk.VkRenderPassBeginInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = self.render_pass,
+            .framebuffer = self.framebuffers.items[image_index],
+            .renderArea = .{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = self.swap_chain_extent,
+            },
+            .clearValueCount = 1,
+            .pClearValues = &clear_color,
+        };
+
+        vk.vkCmdBeginRenderPass(command_buffer, &render_pass_info, vk.VK_SUBPASS_CONTENTS_INLINE);
+        defer _ = vk.vkEndCommandBuffer(command_buffer);
+
+        vk.vkCmdBindPipeline(command_buffer, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+
+        const viewport = vk.VkViewport{
+            .x = 0.0,
+            .y = 0.0,
+            .width = @floatFromInt(self.swap_chain_extent.width),
+            .height = @floatFromInt(self.swap_chain_extent.height),
+            .minDepth = 0.0,
+            .maxDepth = 1.0,
+        };
+        vk.vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+
+        const scissor = vk.VkRect2D{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = self.swap_chain_extent,
+        };
+        vk.vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+
+        vk.vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        vk.vkCmdEndRenderPass(command_buffer);
+    }
+
     fn mainLoop(self: *Self) void {
         while (glfw.glfwWindowShouldClose(self.window) != 1) {
             glfw.glfwPollEvents();
+            self.drawFrame();
         }
+
+        _ = vk.vkDeviceWaitIdle(self.device);
+    }
+
+    fn drawFrame(self: *Self) void {
+        _ = vk.vkWaitForFences(self.device, 1, &self.in_flight_fence, vk.VK_TRUE, std.math.maxInt(u64));
+        _ = vk.vkResetFences(self.device, 1, &self.in_flight_fence);
+
+        var image_index: u32 = 0;
+        _ = vk.vkAcquireNextImageKHR(
+            self.device,
+            self.swap_chain,
+            std.math.maxInt(u64),
+            self.image_available_semaphore,
+            null,
+            &image_index,
+        );
+
+        _ = vk.vkResetCommandBuffer(self.command_buffer, 0);
+        self.recordCommandBuffer(self.command_buffer, image_index);
+
+        const wait_semaphores = [_]vk.VkSemaphore{self.image_available_semaphore};
+        const signal_semaphores = [_]vk.VkSemaphore{self.image_finished_semaphore};
+        const wait_stages = [_]u32{vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        const submit_info = vk.VkSubmitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &wait_semaphores[0],
+            .pWaitDstStageMask = &wait_stages[0],
+            .commandBufferCount = 1,
+            .pCommandBuffers = &self.command_buffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signal_semaphores[0],
+        };
+
+        const result = vk.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.in_flight_fence);
+        if (result != vk.VK_SUCCESS) std.debug.panic("Failed to submit draw command buffer {}\n", .{result});
+
+        const present_info = vk.VkPresentInfoKHR{
+            .sType = vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &signal_semaphores[0],
+            .swapchainCount = 1,
+            .pSwapchains = &self.swap_chain,
+            .pImageIndices = &image_index,
+        };
+
+        _ = vk.vkQueuePresentKHR(self.present_queue, &present_info);
     }
 };
